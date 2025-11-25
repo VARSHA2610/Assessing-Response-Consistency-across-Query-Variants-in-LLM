@@ -2,77 +2,90 @@ import os
 import time
 import pandas as pd
 from openai import OpenAI
+import duckdb
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-
-questions_with_variations = [
-    {
-        "qid": 1,
-        "base":"What are different kinds of cybersecurity attacks",
-        "variations": [
-            "Which top security threats pose the greatest risk to organizations today?",
-            "Can you list and define the primary categories of malicious network activity?",
-            "What are the most frequent online scams and hacks that regular users face?",
-            "What are the most prevalent attack vectors used by threat actors currently?",
-            "What are the trending cybersecurity vulnerabilities dominating the landscape right now?"
-        ]
-    }
-]
+# Input Excel file
+input_xlsx = "questions.xlsx"
+df_questions = pd.read_excel(input_xlsx)
 
 def ask_chatgpt(question_text: str, user_id: str) -> str:
-    """
-    Send a question to the Chat Completions API and return the response text.
-    `user_id` is used to tag the call (simulates different users in a ToS-friendly way).
-    """
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "user", "content": question_text}
-        ],
-        # This `user` field is for your own tracking / abuse monitoring,
-        # NOT an actual account switch – that’s the ToS-safe way to differentiate users.
-        user=user_id,
-        max_tokens=300,
-        temperature=0.7,
-    )
-    return response.choices[0].message.content.strip()
+    """Send question to GPT and return the model's answer."""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": question_text}],
+            user=user_id,
+            max_tokens=300,
+            temperature=0.7,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"ERROR: {e}"
 
 rows = []
 
-for q in questions_with_variations:
-    qid = q["qid"]
-    base = q["base"]
-    variations = q["variations"]
+for idx, row in df_questions.iterrows():
+    base_q = row["Base question"]
 
-    for idx, variation in enumerate(variations, start=1):
-        # "Different user account" — here represented as different user IDs
-        # (e.g. fake user IDs inside your system, NOT separate OpenAI accounts)
-        user_id = f"user_{qid}_{idx}"  # e.g. user_1_1, user_1_2, ...
+    # All other columns are variant categories
+    for col in df_questions.columns:
+        if col == "Base question":
+            continue
 
-        try:
-            answer = ask_chatgpt(variation, user_id=user_id)
-        except Exception as e:
-            answer = f"ERROR: {e}"
+        variant_category = col
+        variant_question = row[col]
+
+        if pd.isna(variant_question) or str(variant_question).strip() == "":
+            continue
+
+        # Unique per-variant user ID
+        user_id = f"user_row{idx}_{variant_category.replace(' ', '_').lower()}"
+
+        answer = ask_chatgpt(str(variant_question), user_id=user_id)
 
         rows.append({
-            "question_id": qid,
-            "base_question": base,
-            "variation_index": idx,
-            "variation_text": variation,
-            "user_id": user_id,
-            "response": answer,
+            "base_question": base_q,
+            "variant_category": variant_category,
+            "variant_question": variant_question,
+            "response": answer
         })
 
-        # Small delay is polite / can help with rate limits
         time.sleep(0.2)
 
-# Store in a table (Pandas DataFrame)
-df = pd.DataFrame(rows)
+# Convert results to DataFrame
+df_output = pd.DataFrame(rows)
 
-# Save as CSV
-output_path = "chatgpt_variations_results.csv"
-df.to_csv(output_path, index=False)
+# ============================
+# SAVE TO CSV
+# ============================
+csv_path = "questions_variant_responses.csv"
+df_output.to_csv(csv_path, index=False)
+print(f"Saved CSV: {csv_path}")
 
-print(f"Saved results to {output_path}")
+# ============================
+# SAVE TO DUCKDB
+# ============================
+db_path = "llm_variants.duckdb"
+table_name = "responses"
 
+con = duckdb.connect(db_path)
+
+# Create table if missing
+con.execute(f"""
+    CREATE TABLE IF NOT EXISTS {table_name} (
+        base_question TEXT,
+        variant_category TEXT,
+        variant_question TEXT,
+        response TEXT
+    );
+""")
+
+# Insert new rows
+con.register("df_output", df_output)
+con.execute(f"INSERT INTO {table_name} SELECT * FROM df_output;")
+
+con.close()
+
+print(f"Inserted {len(df_output)} rows into DuckDB table '{table_name}' in '{db_path}'.")
