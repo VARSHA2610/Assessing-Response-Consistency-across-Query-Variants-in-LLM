@@ -1,17 +1,38 @@
+#!/usr/bin/env python3
 import os
 import time
 import pandas as pd
-from openai import OpenAI
 import duckdb
+from openai import OpenAI
 
+# ==========================
+# CONFIG
+# ==========================
+
+INPUT_FILE = "Dataset(set1).csv"          # your CSV from OneDrive
+OUTPUT_CSV = "questions_variant_responses.csv"
+DB_PATH = "llm_variants_responses.duckdb"
+TABLE_NAME = "responses"
+
+# Set to a small integer while testing (e.g., 3). Use None for full run.
+MAX_ROWS = None
+
+# Small delay between calls to be gentle on the API
+SLEEP_SECONDS = 0.2
+
+# OpenAI client (expects OPENAI_API_KEY in environment)
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Input Excel file
-input_xlsx = "questions.xlsx"
-df_questions = pd.read_excel(input_xlsx)
+
+# ==========================
+# OpenAI helper
+# ==========================
 
 def ask_chatgpt(question_text: str, user_id: str) -> str:
-    """Send question to GPT and return the model's answer."""
+    """
+    Send a single variant question to GPT and return the answer text.
+    Returns an 'ERROR: ...' string if the call fails.
+    """
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
@@ -19,73 +40,121 @@ def ask_chatgpt(question_text: str, user_id: str) -> str:
             user=user_id,
             max_tokens=300,
             temperature=0.7,
+            timeout=30,  # seconds
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"ERROR: {e}"
+        return f"ERROR: {type(e).__name__}: {e}"
 
-rows = []
 
-for idx, row in df_questions.iterrows():
-    base_q = row["Base question"]
+# ==========================
+# Main pipeline
+# ==========================
 
-    # All other columns are variant categories
-    for col in df_questions.columns:
-        if col == "Base question":
+def main():
+    # 1. Read CSV (strip BOM, clean column names)
+    df_questions = pd.read_csv(INPUT_FILE, encoding="utf-8-sig")
+    df_questions.columns = [
+        str(c).strip().lstrip("\ufeff") for c in df_questions.columns
+    ]
+
+    print("Columns:", df_questions.columns)
+
+    # First column is the base question, rest are variants
+    base_col = df_questions.columns[0]
+    variant_cols = list(df_questions.columns[1:])
+
+    # Optionally limit rows for testing
+    if MAX_ROWS is not None:
+        df_questions = df_questions.head(MAX_ROWS)
+
+    # Count how many non-empty variants we will process
+    total_variants = 0
+    for _, row in df_questions.iterrows():
+        base_q = row[base_col]
+        if not isinstance(base_q, str) or not base_q.strip():
+            continue
+        for col in variant_cols:
+            val = row[col]
+            if isinstance(val, str) and val.strip():
+                total_variants += 1
+
+    print(f"Total variants to process: {total_variants}")
+
+    rows_out = []
+    processed = 0
+
+    # 2. Loop over each row and each variant
+    for row_idx, row in df_questions.iterrows():
+        base_q = row[base_col]
+
+        if not isinstance(base_q, str) or not base_q.strip():
             continue
 
-        variant_category = col
-        variant_question = row[col]
+        for col in variant_cols:
+            variant_question = row[col]
 
-        if pd.isna(variant_question) or str(variant_question).strip() == "":
-            continue
+            # Skip empty cells
+            if not isinstance(variant_question, str) or not variant_question.strip():
+                continue
 
-        # Unique per-variant user ID
-        user_id = f"user_row{idx}_{variant_category.replace(' ', '_').lower()}"
+            processed += 1
+            print(
+                f"[{processed}/{total_variants}] row {row_idx + 1} | "
+                f"{col} ...",
+                flush=True,
+            )
 
-        answer = ask_chatgpt(str(variant_question), user_id=user_id)
+            user_id = f"user_row{row_idx}_{col.replace(' ', '_')}"
+            answer = ask_chatgpt(variant_question, user_id=user_id)
 
-        rows.append({
-            "base_question": base_q,
-            "variant_category": variant_category,
-            "variant_question": variant_question,
-            "response": answer
-        })
+            rows_out.append(
+                {
+                    "base_question": base_q,
+                    "variant_category": col,
+                    "variant_question": variant_question,
+                    "variant_response": answer,
+                }
+            )
 
-        time.sleep(0.2)
+            time.sleep(SLEEP_SECONDS)
 
-# Convert results to DataFrame
-df_output = pd.DataFrame(rows)
+    # Convert to DataFrame
+    df_output = pd.DataFrame(rows_out)
 
-# ============================
-# SAVE TO CSV
-# ============================
-csv_path = "questions_variant_responses.csv"
-df_output.to_csv(csv_path, index=False)
-print(f"Saved CSV: {csv_path}")
+    # ==========================
+    # 3. SAVE TO CSV
+    # ==========================
+    df_output.to_csv(OUTPUT_CSV, index=False)
+    print(f"\nSaved CSV: {OUTPUT_CSV} ({len(df_output)} rows)")
 
-# ============================
-# SAVE TO DUCKDB
-# ============================
-db_path = "llm_variants.duckdb"
-table_name = "responses"
+    # ==========================
+    # 4. SAVE TO DUCKDB
+    # ==========================
+    con = duckdb.connect(DB_PATH)
 
-con = duckdb.connect(db_path)
+    # Ensure table exists with correct schema
+    con.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
+            base_question TEXT,
+            variant_category TEXT,
+            variant_question TEXT,
+            variant_response TEXT
+        );
+        """
+    )
 
-# Create table if missing
-con.execute(f"""
-    CREATE TABLE IF NOT EXISTS {table_name} (
-        base_question TEXT,
-        variant_category TEXT,
-        variant_question TEXT,
-        response TEXT
-    );
-""")
+    # Register DataFrame and insert
+    con.register("df_output", df_output)
+    con.execute(f"INSERT INTO {TABLE_NAME} SELECT * FROM df_output;")
+    con.close()
 
-# Insert new rows
-con.register("df_output", df_output)
-con.execute(f"INSERT INTO {table_name} SELECT * FROM df_output;")
+    print(
+        f"Inserted {len(df_output)} rows into DuckDB table "
+        f"'{TABLE_NAME}' in '{DB_PATH}'."
+    )
 
-con.close()
 
-print(f"Inserted {len(df_output)} rows into DuckDB table '{table_name}' in '{db_path}'.")
+if __name__ == "__main__":
+    main()
